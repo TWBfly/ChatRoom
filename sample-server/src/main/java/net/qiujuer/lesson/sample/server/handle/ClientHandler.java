@@ -2,6 +2,7 @@ package net.qiujuer.lesson.sample.server.handle;
 
 
 
+import net.qiujuer.library.clink.core.Connector;
 import net.qiujuer.library.clink.utils.CloseUtils;
 
 import java.io.*;
@@ -18,18 +19,30 @@ import java.util.concurrent.Executors;
 
 public class ClientHandler {
     private final SocketChannel socketChannel;
-    private final ClientReadHandler readHandler;
     private final ClientWriteHandler writeHandler;
     private final ClientHandlerCallback clientHandlerCallback;
     private final String clientInfo;
+    private final Connector connector;
 
     public ClientHandler(SocketChannel socketChannel, ClientHandlerCallback clientHandlerCallback) throws IOException {
         this.socketChannel = socketChannel;
-        socketChannel.configureBlocking(false);//设置非阻塞模式
-        //读
-        Selector readSelector = Selector.open();
-        socketChannel.register(readSelector, SelectionKey.OP_READ);
-        this.readHandler = new ClientReadHandler(readSelector);
+        connector = new Connector() {
+            @Override
+            public void onChannelClosed(SocketChannel channel) {
+                super.onChannelClosed(channel);
+                exitBySelf();
+            }
+
+            @Override
+            protected void onReceiveNewMessage(String str) {
+                super.onReceiveNewMessage(str);
+                clientHandlerCallback.onNewMessageArrived(ClientHandler.this,str);
+            }
+        };
+        connector.setup(socketChannel);
+
+
+
         //写
         Selector writeSelector = Selector.open();
         socketChannel.register(writeSelector, SelectionKey.OP_WRITE);
@@ -45,7 +58,6 @@ public class ClientHandler {
     }
 
     public void exit() {
-        readHandler.exit();
         writeHandler.exit();
         CloseUtils.close(socketChannel);
         System.out.println("客户端已退出：" + clientInfo);
@@ -53,10 +65,6 @@ public class ClientHandler {
 
     public void send(String str) {
         writeHandler.send(str);
-    }
-
-    public void readToPrint() {
-        readHandler.start();
     }
 
     private void exitBySelf() {

@@ -79,18 +79,15 @@ public class TCPServer implements ClientHandler.ClientHandlerCallback {
     public void onNewMessageArrived(ClientHandler handler, String msg) {
         System.out.println("收到—"+handler.getClientInfo()+"--"+msg);
         //异步提交转发任务
-        forwardingThreadPoolExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                synchronized (TCPServer.this){
-                    for (ClientHandler clientHandler:clientHandlerList) {
-                        if (clientHandler.equals(handler)){
-                            //跳过自己
-                            continue;
-                        }
-                        //对其它客户端发送消息
-                        clientHandler.send(msg);
+        forwardingThreadPoolExecutor.execute(() -> {
+            synchronized (TCPServer.this){
+                for (ClientHandler clientHandler:clientHandlerList) {
+                    if (clientHandler.equals(handler)){
+                        //跳过自己
+                        continue;
                     }
+                    //对其它客户端发送消息
+                    clientHandler.send(msg);
                 }
             }
         });
@@ -133,8 +130,6 @@ public class TCPServer implements ClientHandler.ClientHandlerCallback {
                             try {
                                 // 客户端构建异步线程
                                 ClientHandler clientHandler = new ClientHandler(socketChannel, TCPServer.this);
-                                // 读取数据并打印
-                                clientHandler.readToPrint();
                                 //添加同步处理
                                 synchronized (TCPServer.this) {
                                     clientHandlerList.add(clientHandler);
