@@ -68,7 +68,7 @@ public class UDPSearcher {
         byteBuffer.putInt(LISTEN_PORT);
         // 直接构建packet
         DatagramPacket requestPacket = new DatagramPacket(byteBuffer.array(),
-                byteBuffer.position() + 1);
+                byteBuffer.position());
         // 广播地址
         requestPacket.setAddress(InetAddress.getByName("255.255.255.255"));
         // 设置服务器端口

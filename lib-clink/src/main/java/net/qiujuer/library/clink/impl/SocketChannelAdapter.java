@@ -4,60 +4,87 @@ import net.qiujuer.library.clink.core.IoArgs;
 import net.qiujuer.library.clink.core.IoProvider;
 import net.qiujuer.library.clink.core.Receiver;
 import net.qiujuer.library.clink.core.Sender;
+import net.qiujuer.library.clink.impl.exceptions.EmptyIoArgsException;
 import net.qiujuer.library.clink.utils.CloseUtils;
 
 import java.io.IOException;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class SocketChannelAdapter implements Sender, Receiver, Cloneable {
-    private final AtomicBoolean isClosed = new AtomicBoolean(false);//标记是否已经关闭
+    private final AtomicBoolean isClosed = new AtomicBoolean(false);
     private final SocketChannel channel;
     private final IoProvider ioProvider;
     private final OnChannelStatusChangedListener listener;
-
-    private IoArgs.IoArgsEventListener receiveIoEventListener;
-    private IoArgs.IoArgsEventListener sendIoEventListener;
+    private final AbsProviderCallback inputCallback;
+    private final AbsProviderCallback outputCallback;
 
     public SocketChannelAdapter(SocketChannel channel, IoProvider ioProvider,
                                 OnChannelStatusChangedListener listener) throws IOException {
         this.channel = channel;
         this.ioProvider = ioProvider;
         this.listener = listener;
-
-        channel.configureBlocking(false);
+        this.inputCallback = new InputProviderCallback(ioProvider, channel, SelectionKey.OP_READ);
+        this.outputCallback = new OutputProviderCallback(ioProvider, channel, SelectionKey.OP_WRITE);
     }
 
+    @Override
+    public void setReceiveListener(IoArgs.IoArgsEventProcessor processor) {
+        if (inputCallback.eventProcessor != processor) {
+            ioProvider.unregister(channel);
+        }
+        inputCallback.eventProcessor = processor;
+    }
 
     @Override
-    public boolean receiveAsync(IoArgs.IoArgsEventListener listener) throws IOException {
-        if (isClosed.get()) {
+    public void postReceiveAsync() throws Exception {
+        if (isClosed.get() || !channel.isOpen()) {
             throw new IOException("Current channel is closed!");
         }
-
-        receiveIoEventListener = listener;
-
-        return ioProvider.registerInput(channel, inputCallback);
+        // 进行Callback状态监测，判断是否处于自循环状态
+        inputCallback.checkAttachNull();
+        // 注册输入流程
+        ioProvider.register(inputCallback);
     }
 
     @Override
-    public boolean sendAsync(IoArgs args, IoArgs.IoArgsEventListener listener) throws IOException {
-        if (isClosed.get()) {
+    public long getLastReadTime() {
+        return inputCallback.lastActiveTime;
+    }
+
+    @Override
+    public void setSendListener(IoArgs.IoArgsEventProcessor processor) {
+        if (inputCallback.eventProcessor != processor) {
+            ioProvider.unregister(channel);
+        }
+        outputCallback.eventProcessor = processor;
+    }
+
+    @Override
+    public void postSendAsync() throws Exception {
+        if (isClosed.get() || !channel.isOpen()) {
             throw new IOException("Current channel is closed!");
         }
+        // 进行Callback状态监测，判断是否处于自循环状态
+        outputCallback.checkAttachNull();
 
-        sendIoEventListener = listener;
-        // 当前发送的数据附加到回调中
-        outputCallback.setAttach(args);
-        return ioProvider.registerOutput(channel, outputCallback);
+        // 优先发送一次
+        // outputCallback.run();
+
+        ioProvider.register(outputCallback);
     }
 
     @Override
-    public void close() throws IOException {
+    public long getLastWriteTime() {
+        return outputCallback.lastActiveTime;
+    }
+
+    @Override
+    public void close() {
         if (isClosed.compareAndSet(false, true)) {
             // 解除注册回调
-            ioProvider.unRegisterInput(channel);
-            ioProvider.unRegisterOutput(channel);
+            ioProvider.unregister(channel);
             // 关闭
             CloseUtils.close(channel);
             // 回调当前Channel已关闭
@@ -65,50 +92,99 @@ public class SocketChannelAdapter implements Sender, Receiver, Cloneable {
         }
     }
 
-    private final IoProvider.HandleInputCallback inputCallback = new IoProvider.HandleInputCallback() {
+    abstract class AbsProviderCallback extends IoProvider.HandleProviderCallback {
+        volatile IoArgs.IoArgsEventProcessor eventProcessor;
+        volatile long lastActiveTime = System.currentTimeMillis();
+
+        AbsProviderCallback(IoProvider provider, SocketChannel channel, int ops) {
+            super(provider, channel, ops);
+        }
+
         @Override
-        protected void canProviderInput() {
+        protected final boolean onProvideIo(IoArgs args) {
             if (isClosed.get()) {
-                return;
+                return false;
             }
 
-            IoArgs args = new IoArgs();
-            IoArgs.IoArgsEventListener listener = SocketChannelAdapter.this.receiveIoEventListener;
+            final IoArgs.IoArgsEventProcessor processor = eventProcessor;
+            if (processor == null) {
+                return false;
+            }
 
-            if (listener != null) {
-                listener.onStarted(args);
+            // 刷新输出时间
+            lastActiveTime = System.currentTimeMillis();
+
+            if (args == null) {
+                // 拿一份新的IoArgs
+                args = processor.provideIoArgs();
             }
 
             try {
-                // 具体的读取操作
-                if (args.read(channel) > 0 && listener != null) {
-                    // 读取完成回调
-                    listener.onCompleted(args);
-                } else {
-                    throw new IOException("Cannot read any data!");
+                if (args == null) {
+                    // 错误回调
+                    throw new EmptyIoArgsException("ProvideIoArgs is null.");
                 }
-            } catch (IOException ignored) {
+
+                int count = consumeIoArgs(args, channel);
+
+                // 检查是否还有未消费数据；并且.... 就直接注册下一次调度
+                // 1. 本次一条数据未消费
+                // 2. 需要消费完全所有数据
+                if (args.remained() && (count == 0 || args.isNeedConsumeRemaining())) {
+                    // 附加当前未消费完成的args
+                    attach = args;
+                    // 再次注册数据发送
+                    return true;
+                } else {
+                    // 输出完成回调
+                    return processor.onConsumeCompleted(args);
+                }
+            } catch (IOException e) {
+                if (processor.onConsumeFailed(e)) {
+                    CloseUtils.close(SocketChannelAdapter.this);
+                }
+                return false;
+            }
+        }
+
+        @Override
+        public void fireThrowable(Throwable e) {
+            final IoArgs.IoArgsEventProcessor processor = this.eventProcessor;
+            if (processor == null || processor.onConsumeFailed(e)) {
                 CloseUtils.close(SocketChannelAdapter.this);
             }
-
-
         }
-    };
 
+        protected abstract int consumeIoArgs(IoArgs args, SocketChannel channel) throws IOException;
+    }
 
-    private final IoProvider.HandleOutputCallback outputCallback = new IoProvider.HandleOutputCallback() {
+    class InputProviderCallback extends AbsProviderCallback {
+
+        InputProviderCallback(IoProvider provider, SocketChannel channel, int ops) {
+            super(provider, channel, ops);
+        }
+
         @Override
-        protected void canProviderOutput(Object attach) {
-            if (isClosed.get()) {
-                return;
-            }
-            // TODO
-            sendIoEventListener.onCompleted(null);
+        protected int consumeIoArgs(IoArgs args, SocketChannel channel) throws IOException {
+            return args.readFrom(channel);
         }
-    };
+    }
 
+    class OutputProviderCallback extends AbsProviderCallback {
+
+        OutputProviderCallback(IoProvider provider, SocketChannel channel, int ops) {
+            super(provider, channel, ops);
+        }
+
+        @Override
+        protected int consumeIoArgs(IoArgs args, SocketChannel channel) throws IOException {
+            return args.writeTo(channel);
+        }
+    }
 
     public interface OnChannelStatusChangedListener {
         void onChannelClosed(SocketChannel channel);
     }
+
+
 }
